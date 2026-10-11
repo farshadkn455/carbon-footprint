@@ -8,6 +8,4 @@
 coverage/
 *.log
 .DS_Store
-
 backend/ecotrack.db
-backend/.env
