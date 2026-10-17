@@ -23,6 +23,56 @@ function LeafLogo() {
   )
 }
 
+
+function getAssistantReply(question) {
+  const q = question.toLowerCase();
+
+  if (
+    q.includes("highest") ||
+    q.includes("most") ||
+    q.includes("maximum")
+  ) {
+    return "To find the vehicle with the highest emissions, compare the CO₂ emissions of your vehicles in the EcoTrackPlus dashboard.";
+  }
+
+  if (
+    q.includes("reduce") ||
+    q.includes("lower") ||
+    q.includes("decrease")
+  ) {
+    return "You can reduce emissions by using public transport, carpooling, maintaining your vehicle, avoiding unnecessary trips, and choosing fuel-efficient vehicles.";
+  }
+
+  if (
+    q.includes("green") ||
+    q.includes("alternative") ||
+    q.includes("eco-friendly")
+  ) {
+    return "Consider public transport, cycling, walking, carpooling, or an electric vehicle when practical. The best alternative depends on your travel distance and available options.";
+  }
+
+  if (
+    q.includes("calculate") ||
+    q.includes("emission") ||
+    q.includes("carbon footprint") ||
+    q.includes("co2")
+  ) {
+    return "Open the Calculator tab, enter your vehicle and travel details, and use the calculated CO₂ emissions to understand your carbon footprint.";
+  }
+
+  if (
+    q.includes("hello") ||
+    q.includes("hi") ||
+    q.includes("hey")
+  ) {
+    return "Hello! I'm EcoTrackPlus Assistant. Ask me about vehicle emissions, carbon footprints, or greener travel.";
+  }
+
+  return "I can help with vehicle emissions, carbon footprints, greener travel, and reducing pollution. Try asking: How can I reduce emissions?";
+}
+
+
+
 function App() {
   const [vehicleMake, setVehicleMake] = useState('')
   const [vehicleModel, setVehicleModel] = useState('')
@@ -74,6 +124,11 @@ function App() {
   const [authError, setAuthError] = useState('')
   const [authLoading, setAuthLoading] = useState(false)
 
+  const [showAssistant, setShowAssistant] = useState(false)
+  const [assistantMessages, setAssistantMessages] = useState([])
+  const [assistantInput, setAssistantInput] = useState('')
+  const [assistantLoading, setAssistantLoading] = useState(false)
+  const [assistantError, setAssistantError] = useState('')
   // Carbon budget (kg CO2) shown on the dashboard. Saved in this browser only.
   const [carbonBudget, setCarbonBudget] = useState(() => {
     const saved = Number(localStorage.getItem('ecoTrackBudget'))
@@ -244,6 +299,8 @@ function App() {
   }
 
   function handleLogout() {
+    setShowAssistant(false)
+    setAssistantMessages([])
     localStorage.removeItem('ecoTrackToken')
     localStorage.removeItem('ecoTrackUser')
 
@@ -295,18 +352,105 @@ function App() {
   }
 
   function openDashboard() {
+    setShowAssistant(false)
     setShowDashboard(true)
     setShowHistory(false)
     loadHistory()
   }
 
   function openHistory() {
+    setShowAssistant(false)
     setShowHistory(true)
     setShowDashboard(false)
     loadHistory()
   }
 
+function openAssistant() {
+  setShowAssistant(true)
+  setShowDashboard(false)
+  setShowHistory(false)
+}
+
+
+
+
+
+
+async function sendAssistantMessage(text) {
+  const content = (text ?? assistantInput).trim()
+
+  if (!content || assistantLoading) return
+
+  const token = localStorage.getItem('ecoTrackToken')
+
+  if (!token) {
+    setAssistantError('Please log in to use the AI assistant.')
+    return
+  }
+
+  const next = [
+    ...assistantMessages,
+    { role: 'user', content }
+  ]
+
+  setAssistantMessages(next)
+  setAssistantInput('')
+  setAssistantError('')
+  setAssistantLoading(true)
+
+  const controller = new AbortController()
+  const timeoutId = setTimeout(() => controller.abort(), 45000)
+  const startedAt = performance.now()
+
+  try {
+    const response = await fetch(`${API_URL}/api/assistant`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${token}`
+      },
+      body: JSON.stringify({ message: content }),
+      signal: controller.signal
+    })
+
+    console.log(
+      `Assistant response received in ${(
+        (performance.now() - startedAt) / 1000
+      ).toFixed(2)} seconds`
+    )
+
+    const data = await response.json()
+
+    if (!response.ok) {
+      throw new Error(data.error || 'Failed to get an AI response.')
+    }
+
+    setAssistantMessages([
+      ...next,
+      { role: 'assistant', content: data.reply }
+    ])
+  } catch (error) {
+    if (error.name === 'AbortError') {
+      setAssistantError(
+        'The assistant took too long to respond. Please try again.'
+      )
+    } else {
+      setAssistantError(
+        error.message || 'Could not connect to the AI assistant.'
+      )
+    }
+  } finally {
+    clearTimeout(timeoutId)
+    setAssistantLoading(false)
+  }
+}
+ 
+
+
+
+
   function openCalculator() {
+    setShowAssistant(false)
     setShowHistory(false)
     setShowDashboard(false)
   }
@@ -457,7 +601,9 @@ function App() {
     .slice(0, 4)
   const topVehicleMax = Math.max(...topVehicles.map((entry) => entry[1]), 1)
 
-  const activeView = showDashboard
+  const activeView = showAssistant
+  ? 'assistant'
+  : showDashboard
     ? 'dashboard'
     : showHistory
       ? 'history'
@@ -693,6 +839,13 @@ function App() {
             onClick={openHistory}
           >
             History
+          </button>
+          <button
+            type="button"
+            className={activeView === 'assistant' ? 'tab active' : 'tab'}
+            onClick={openAssistant}
+          >
+          Assistant
           </button>
         </nav>
 
@@ -1062,6 +1215,71 @@ function App() {
             )}
           </section>
         )}
+
+          {/* ============ ASSISTANT ============ */}
+            {activeView === 'assistant' && (
+            <section className="assistant">
+              <h2>Eco assistant</h2>
+              <p className="lead">
+                Ask about your emissions, compare vehicles, or get tips to cut your CO₂.
+              </p>
+
+                <div className="chat panel">
+              <div className="chat-log" aria-live="polite">
+                {assistantMessages.length === 0 && (
+                <div className="chat-empty">
+                  <p className="muted">Try one of these:</p>
+               {[
+              'Which of my vehicles emits the most?',
+              'Suggest a greener alternative to my most-used vehicle.',
+              'How can I reduce my emissions?',
+              'How is my CO₂ calculated?'
+            ].map((prompt) => (
+              <button
+                key={prompt}
+                type="button"
+                className="chip"
+                onClick={() => sendAssistantMessage(prompt)}
+              >
+                {prompt}
+              </button>
+            ))}
+          </div>
+        )}
+
+        {assistantMessages.map((message, index) => (
+          <div key={index} className={`bubble ${message.role}`}>
+            {message.content}
+          </div>
+        ))}
+
+        {assistantLoading && <div className="bubble assistant muted">Thinking...</div>}
+      </div>
+
+      {assistantError && <p className="history-error">{assistantError}</p>}
+
+      <form
+        className="chat-form"
+        onSubmit={(event) => {
+          event.preventDefault()
+          sendAssistantMessage()
+        }}
+      >
+        <input
+          type="text"
+          value={assistantInput}
+          onChange={(event) => setAssistantInput(event.target.value)}
+          placeholder="Ask something about your emissions..."
+          maxLength={1000}
+          aria-label="Message the assistant"
+        />
+        <button className="btn btn-primary" type="submit" disabled={assistantLoading}>
+          Send
+        </button>
+      </form>
+    </div>
+  </section>
+)}
       </main>
     </div>
   )

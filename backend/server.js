@@ -1,6 +1,7 @@
 const fs = require('fs')
 const Database = require('better-sqlite3')
 const express = require('express')
+const { GoogleGenAI } = require('@google/genai')
 const cors = require('cors')
 require('dotenv').config()
 
@@ -692,6 +693,179 @@ app.post('/api/auth/reset-password', async (req, res) => {
 
     return res.status(500).json({
       error: 'Could not reset password.'
+    })
+  }
+})
+
+
+
+// Function to check if a message is related to the emission dashboard
+
+
+function isEmissionDashboardQuestion(message) {
+  const text = message.toLowerCase()
+
+  return /\b(emission|emissions|co2|carbon|history|historical|calculation|calculations|dashboard)\b/i.test(text)
+    && /\b(my|mine|all|total|overall|history|historical|previous|last|latest|saved|recorded|calculate|show|what|how)\b/i.test(text)
+}
+
+
+
+
+
+// Gemini AI Assistant endpoint
+
+const genAI = process.env.GEMINI_API_KEY
+  ? new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY })
+  : null
+
+app.post('/api/assistant', requireAuth, async (req, res) => {
+  try {
+    const message = String(req.body.message || '').trim()
+
+    if (!message) {
+      return res.status(400).json({
+        error: 'Please enter a message.'
+      })
+    }
+
+    if (message.length > 4000) {
+      return res.status(400).json({
+        error: 'Message must be 4000 characters or fewer.'
+      })
+    }
+
+    if (!genAI) {
+      return res.status(503).json({
+        error: 'Gemini is not configured. Check your backend .env file.'
+      })
+    }
+    
+
+
+
+let dashboardContext = ''
+
+if (isEmissionDashboardQuestion(message)) {
+  const summary = db.prepare(`
+    SELECT
+      COUNT(*) AS totalCalculations,
+      COALESCE(SUM(co2Kg), 0) AS totalCO2,
+      COALESCE(SUM(distanceKm), 0) AS totalDistance
+    FROM calculation_history
+    WHERE userId = ?
+  `).get(req.user.id)
+
+  const history = db.prepare(`
+    SELECT vehicleMake, vehicleModel, modelYear,
+           distanceKm, co2Kg, calculatedAt
+    FROM calculation_history
+    WHERE userId = ?
+    ORDER BY calculatedAt DESC, id DESC
+    LIMIT 5
+  `).all(req.user.id)
+
+  if (summary.totalCalculations > 0) {
+    dashboardContext = `
+Total saved calculations: ${summary.totalCalculations}
+Total CO2 emissions: ${Number(summary.totalCO2).toFixed(2)} kg
+Total distance travelled: ${Number(summary.totalDistance).toFixed(2)} km
+
+Latest five records:
+${history.map((item, index) => `
+${index + 1}. ${item.vehicleMake} ${item.vehicleModel} (${item.modelYear})
+Distance: ${item.distanceKm} km
+CO2: ${Number(item.co2Kg).toFixed(2)} kg
+Date: ${item.calculatedAt}
+`).join('\n')}
+`
+  } else {
+    dashboardContext = 'No saved emission calculations were found for this user.'
+  }
+}
+
+
+
+    
+const prompt = `
+You are EcoTrackPlus Assistant, a helpful environmental
+and vehicle-emissions assistant.
+
+Answer clearly and accurately.
+Keep answers short and answer only what the user asks.
+Do not invent user statistics.
+Use a dot (.) for bullet points only when a list is necessary.
+Never use asterisks (*) for formatting.
+Avoid unnecessary introductions and extra information.
+
+User's saved dashboard data:
+${dashboardContext || 'No dashboard data was retrieved for this question.'}
+When asked for total or all-time emissions, report the total CO2 emissions
+from all saved calculations. Do not add together records manually in your
+response or invent missing values.
+
+User question:
+${message}
+`
+
+
+    let reply
+
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      try {
+        console.log('Sending request to Gemini...')
+
+const result = await genAI.models.generateContent({
+  model: process.env.GEMINI_MODEL || 'gemini-3.8-flash',
+  contents: prompt
+})
+
+console.log('Gemini response received')
+
+        reply = result.text?.trim()
+
+        if (!reply) {
+          return res.status(502).json({
+            error: 'Gemini returned an empty response. Please try again.'
+          })
+        }
+
+        break
+      } catch (error) {
+        const errorMessage = String(error.message || error)
+
+        console.error(`Gemini attempt ${attempt} failed:`, errorMessage)
+
+        const retryable =
+          /503|UNAVAILABLE|high demand|429|RESOURCE_EXHAUSTED/i.test(
+            errorMessage
+          )
+
+        if (!retryable || attempt === 3) {
+          throw error
+        }
+
+        await new Promise(resolve =>
+          setTimeout(resolve, attempt * 1500)
+        )
+      }
+    }
+
+    return res.json({ reply })
+  } catch (error) {
+    const errorMessage = String(error.message || error)
+
+    console.error('Gemini assistant error:', errorMessage)
+
+    const temporarilyUnavailable =
+      /503|UNAVAILABLE|high demand|429|RESOURCE_EXHAUSTED/i.test(
+        errorMessage
+      )
+
+    return res.status(temporarilyUnavailable ? 503 : 500).json({
+      error: temporarilyUnavailable
+        ? 'The AI assistant is temporarily busy. Please try again shortly.'
+        : 'The assistant could not respond right now. Please try again.'
     })
   }
 })
