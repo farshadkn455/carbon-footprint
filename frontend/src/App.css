@@ -1187,3 +1187,103 @@ tbody tr:hover {
     transition: none !important;
   }
 }
+
+/* ---------- Budget alerts ---------- */
+
+.alert-banner {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 6px 14px;
+  padding: 16px 20px;
+  margin-bottom: 24px;
+  border-radius: 14px;
+  border-left: 8px solid var(--amber);
+  background: #fff6d9;
+  color: #5a4300;
+}
+
+.alert-banner.over {
+  border-left-color: var(--danger);
+  background: var(--danger-bg);
+  color: var(--danger);
+}
+
+.dash .alert-banner {
+  margin-bottom: 0;
+}
+
+.settings .grid-2 {
+  margin-bottom: 18px;
+}
+
+.check-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin: 0 0 18px;
+  font-weight: 500;
+  font-size: 15px;
+  cursor: pointer;
+}
+
+.check-row input {
+  width: 20px;
+  height: 20px;
+  flex: none;
+  accent-color: var(--leaf);
+}
+
+.settings-note {
+  margin-bottom: 16px;
+}
+
+.settings-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+}
+
+.settings-actions .btn-primary {
+  width: auto;
+}
+
+.btn-ghost {
+  background: var(--white);
+  color: var(--forest);
+  border: 1.5px solid var(--line);
+}
+
+.btn-ghost:hover:not(:disabled) {
+  border-color: var(--leaf);
+}
+
+.btn-ghost:disabled {
+  cursor: not-allowed;
+  opacity: 0.5;
+}
+
+.alert-banner.high {
+  border-left-color: #e8590c;
+  background: #ffe8d6;
+  color: #7a2e00;
+}
+
+/* ---------- Clear history ---------- */
+
+.hist-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 16px;
+}
+
+.btn-danger {
+  background: var(--white);
+  color: var(--danger);
+  border: 1.5px solid var(--danger);
+}
+
+.btn-danger:hover {
+  background: var(--danger-bg);
+}

@@ -32,6 +32,30 @@ function LeafLogo() {
   )
 }
 
+function BudgetBanner({ percent, budget, total, emailNotice }) {
+  if (percent < 80) return null
+
+  const over = percent >= 100
+  const high = percent >= 90
+
+  return (
+    <div
+      className={over ? 'alert-banner over' : high ? 'alert-banner high' : 'alert-banner warn'}
+      role="alert"
+    >
+      <strong>
+        {over
+          ? 'You have used your whole carbon budget.'
+          : `You have used ${percent}% of your carbon budget.`}
+      </strong>
+      <span>
+        {total.toFixed(2)} kg of {budget} kg.
+        {emailNotice ? ` ${emailNotice}` : ''}
+      </span>
+    </div>
+  )
+}
+
 function App() {
   const [vehicleMake, setVehicleMake] = useState('')
   const [vehicleModel, setVehicleModel] = useState('')
@@ -90,17 +114,112 @@ function App() {
   const [assistantError, setAssistantError] = useState('')
   const chatEndRef = useRef(null)
 
-  // Carbon budget (kg CO2) shown on the dashboard. Saved in this browser only.
-  const [carbonBudget, setCarbonBudget] = useState(() => {
-    const saved = Number(localStorage.getItem('ecoTrackBudget'))
-    return Number.isFinite(saved) && saved > 0 ? saved : 500
-  })
+  // Budget and email-alert settings, stored on the server for each user.
+  const [savedBudget, setSavedBudget] = useState(500)
+  const [budgetInput, setBudgetInput] = useState('500')
+  const [alertEmail, setAlertEmail] = useState('')
+  const [alertsEnabled, setAlertsEnabled] = useState(false)
+  const [emailConfigured, setEmailConfigured] = useState(false)
+  const [settingsMessage, setSettingsMessage] = useState('')
+  const [settingsError, setSettingsError] = useState('')
+  const [settingsSaving, setSettingsSaving] = useState(false)
+  const [alertNotice, setAlertNotice] = useState('')
 
-  function updateBudget(value) {
-    setCarbonBudget(value)
-    const n = Number(value)
-    if (Number.isFinite(n) && n > 0) {
-      localStorage.setItem('ecoTrackBudget', String(n))
+  async function loadSettings(token) {
+    try {
+      const response = await fetch(`${API_URL}/api/settings`, {
+        headers: { Authorization: `Bearer ${token}` }
+      })
+      const data = await response.json()
+
+      if (!response.ok) {
+        throw new Error(data.error || 'Could not load settings.')
+      }
+
+      setSavedBudget(data.carbonBudget)
+      setBudgetInput(String(data.carbonBudget))
+      setAlertEmail(data.alertEmail || authUser?.email || '')
+      setAlertsEnabled(Boolean(data.alertsEnabled))
+      setEmailConfigured(Boolean(data.emailConfigured))
+    } catch (error) {
+      console.error('Error loading settings:', error)
+    }
+  }
+
+  async function saveSettings(event) {
+    event.preventDefault()
+    setSettingsMessage('')
+    setSettingsError('')
+    setSettingsSaving(true)
+
+    try {
+      const response = await fetch(`${API_URL}/api/settings`, {
+        method: 'PUT',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${authToken}`
+        },
+        body: JSON.stringify({
+          carbonBudget: Number(budgetInput),
+          alertEmail: alertEmail.trim(),
+          alertsEnabled
+        })
+      })
+      const data = await response.json()
+
+      if (!response.ok) {
+        throw new Error(data.error || 'Could not save settings.')
+      }
+
+      setSavedBudget(data.carbonBudget)
+      setEmailConfigured(Boolean(data.emailConfigured))
+      setSettingsMessage('Settings saved.')
+    } catch (error) {
+      setSettingsError(error.message || 'Could not connect to the backend.')
+    } finally {
+      setSettingsSaving(false)
+    }
+  }
+
+  async function sendSummaryEmail() {
+    setSettingsMessage('')
+    setSettingsError('')
+
+    try {
+      const response = await fetch(`${API_URL}/api/settings/send-summary`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${authToken}` }
+      })
+      const data = await response.json()
+
+      if (!response.ok) {
+        throw new Error(data.error || 'Could not send the summary.')
+      }
+
+      setSettingsMessage(data.message || 'Summary sent.')
+    } catch (error) {
+      setSettingsError(error.message || 'Could not connect to the backend.')
+    }
+  }
+
+  async function sendTestEmail() {
+    setSettingsMessage('')
+    setSettingsError('')
+
+    try {
+      const response = await fetch(`${API_URL}/api/settings/test-email`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${authToken}` }
+      })
+      const data = await response.json()
+
+      if (!response.ok) {
+        throw new Error(data.error || 'Could not send the test email.')
+      }
+
+      setSettingsMessage(data.message || 'Test email sent.')
+    } catch (error) {
+      setSettingsError(error.message || 'Could not connect to the backend.')
     }
   }
 
@@ -128,6 +247,15 @@ function App() {
         console.error('Error fetching emission factors:', error)
       )
   }, [])
+
+  // Once logged in, load history (for the budget warning) and settings.
+  useEffect(() => {
+    if (authToken) {
+      loadHistory()
+      loadSettings(authToken)
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [authToken])
 
   // Keep the newest assistant message in view.
   useEffect(() => {
@@ -280,6 +408,13 @@ function App() {
     setAuthMode('login')
     setShowHistory(false)
     setShowDashboard(false)
+    setAlertNotice('')
+    setSavedBudget(500)
+    setBudgetInput('500')
+    setAlertEmail('')
+    setAlertsEnabled(false)
+    setSettingsMessage('')
+    setSettingsError('')
   }
 
   async function loadHistory() {
@@ -314,6 +449,38 @@ function App() {
       )
     } finally {
       setHistoryLoading(false)
+    }
+  }
+
+  async function clearHistory() {
+    const confirmed = window.confirm(
+      'Delete all your saved calculations? This cannot be undone.'
+    )
+
+    if (!confirmed) return
+
+    setHistoryError('')
+
+    try {
+      const response = await fetch(`${API_URL}/api/history`, {
+        method: 'DELETE',
+        headers: {
+          Authorization: `Bearer ${authToken}`
+        }
+      })
+
+      const data = await response.json()
+
+      if (!response.ok) {
+        throw new Error(data.error || 'Could not clear history.')
+      }
+
+      setHistoryRecords([])
+      setEmissionResult(null)
+      setCalcDetails(null)
+      setAlertNotice('')
+    } catch (error) {
+      setHistoryError(error.message || 'Could not connect to the backend.')
     }
   }
 
@@ -467,6 +634,7 @@ function App() {
     const fuelConsumed = distance / mileage
     const result = fuelConsumed * emissionFactor
 
+    setAlertNotice('')
     setEmissionResult(result)
     setCalcDetails({
       distance,
@@ -509,6 +677,11 @@ function App() {
       })
       .then((data) => {
         console.log(data.message || 'Calculation saved.')
+        loadHistory()
+
+        if (data.alert?.emailSent) {
+          setAlertNotice('An alert email was sent.')
+        }
       })
       .catch((error) => {
         console.error('Error saving calculation:', error)
@@ -543,8 +716,9 @@ function App() {
   )
 
   // Budget progress.
-  const budgetNumber = Number(carbonBudget) > 0 ? Number(carbonBudget) : 500
-  const budgetPercent = Math.min(Math.round((totalCO2 / budgetNumber) * 100), 100)
+  const budgetNumber = Number(savedBudget) > 0 ? Number(savedBudget) : 500
+  const budgetPercentRaw = Math.round((totalCO2 / budgetNumber) * 100)
+  const budgetPercent = Math.min(budgetPercentRaw, 100)
 
   // Highest-emitting vehicles.
   const vehicleTotals = {}
@@ -816,6 +990,13 @@ function App() {
       <main className="page">
         {/* ============ CALCULATOR ============ */}
         {activeView === 'calculator' && (
+          <>
+          <BudgetBanner
+            percent={budgetPercentRaw}
+            budget={budgetNumber}
+            total={totalCO2}
+            emailNotice={alertNotice}
+          />
           <section className="calc">
             <div className="calc-form">
               <h2>Calculate your trip emissions</h2>
@@ -998,6 +1179,7 @@ function App() {
               )}
             </aside>
           </section>
+          </>
         )}
 
         {/* ============ DASHBOARD ============ */}
@@ -1005,6 +1187,13 @@ function App() {
           <section className="dash">
             {historyLoading && <p className="muted">Loading dashboard...</p>}
             {historyError && <p className="history-error">{historyError}</p>}
+
+            <BudgetBanner
+              percent={budgetPercentRaw}
+              budget={budgetNumber}
+              total={totalCO2}
+              emailNotice={alertNotice}
+            />
 
             <div className="hero">
               <div>
@@ -1017,23 +1206,85 @@ function App() {
               <div className="budget">
                 <div className="budget-top">
                   <span>{budgetPercent}% of your budget used</span>
-                  <label className="budget-edit" htmlFor="budget">
-                    Budget
-                    <input
-                      id="budget"
-                      type="number"
-                      min="1"
-                      value={carbonBudget}
-                      onChange={(event) => updateBudget(event.target.value)}
-                    />
-                    kg
-                  </label>
+                  <span className="budget-edit">Budget: {budgetNumber} kg</span>
                 </div>
                 <div className="budget-track">
                   <div className="budget-fill" style={{ width: `${budgetPercent}%` }} />
                 </div>
               </div>
             </div>
+
+            <form className="panel settings" onSubmit={saveSettings}>
+              <h3>Budget and email alerts</h3>
+
+              <div className="grid-2">
+                <div>
+                  <label htmlFor="budget">Carbon budget (kg CO₂)</label>
+                  <input
+                    id="budget"
+                    type="number"
+                    min="1"
+                    step="any"
+                    value={budgetInput}
+                    onChange={(event) => setBudgetInput(event.target.value)}
+                    required
+                  />
+                </div>
+
+                <div>
+                  <label htmlFor="alert-email">Alert email</label>
+                  <input
+                    id="alert-email"
+                    type="email"
+                    value={alertEmail}
+                    onChange={(event) => setAlertEmail(event.target.value)}
+                    placeholder="you@example.com"
+                  />
+                </div>
+              </div>
+
+              <label className="check-row" htmlFor="alerts-on">
+                <input
+                  id="alerts-on"
+                  type="checkbox"
+                  checked={alertsEnabled}
+                  onChange={(event) => setAlertsEnabled(event.target.checked)}
+                />
+                Email me when I reach 80%, 90% and 100% of my budget
+              </label>
+
+              {!emailConfigured && (
+                <p className="muted settings-note">
+                  Email sending is not set up on the server yet. You will still
+                  see the warning banner in the app.
+                </p>
+              )}
+
+              {settingsError && <p className="history-error">{settingsError}</p>}
+              {settingsMessage && <p className="notice">{settingsMessage}</p>}
+
+              <div className="settings-actions">
+                <button className="btn btn-primary" type="submit" disabled={settingsSaving}>
+                  {settingsSaving ? 'Saving...' : 'Save settings'}
+                </button>
+                <button
+                  type="button"
+                  className="btn btn-ghost"
+                  onClick={sendTestEmail}
+                  disabled={!emailConfigured || !alertEmail.trim()}
+                >
+                  Send test email
+                </button>
+                <button
+                  type="button"
+                  className="btn btn-ghost"
+                  onClick={sendSummaryEmail}
+                  disabled={!emailConfigured || !alertEmail.trim()}
+                >
+                  Email my current total
+                </button>
+              </div>
+            </form>
 
             <div className="metrics">
               <div>
@@ -1123,8 +1374,18 @@ function App() {
         {/* ============ HISTORY ============ */}
         {activeView === 'history' && (
           <section className="hist">
-            <h2>Calculation history</h2>
-            <p className="lead">Every calculation you have saved.</p>
+            <div className="hist-head">
+              <div>
+                <h2>Calculation history</h2>
+                <p className="lead">Every calculation you have saved.</p>
+              </div>
+
+              {historyRecords.length > 0 && (
+                <button type="button" className="btn btn-danger" onClick={clearHistory}>
+                  Clear all
+                </button>
+              )}
+            </div>
 
             {historyLoading && <p className="muted">Loading history...</p>}
             {historyError && <p className="history-error">{historyError}</p>}

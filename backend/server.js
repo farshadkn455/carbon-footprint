@@ -8,6 +8,7 @@ require('dotenv').config()
 const bcrypt = require('bcryptjs')
 const crypto = require('crypto')
 const jwt = require('jsonwebtoken')
+const nodemailer = require('nodemailer')
 
 const db = new Database('ecotrack.db')
 db.exec(`
@@ -38,7 +39,7 @@ db.exec(`
     expires_at INTEGER NOT NULL
   )
 `)
- 
+
 const vehicleColumns = db.prepare(
   'PRAGMA table_info(vehicles)'
 ).all()
@@ -76,10 +77,6 @@ if (!columnNames.includes('fuelEconomySource')) {
 if (!columnNames.includes('sourceUrl')) {
   db.exec('ALTER TABLE vehicles ADD COLUMN sourceUrl TEXT')
 }
-
-
-
-
 
 const { parse } = require('csv-parse/sync')
 
@@ -197,8 +194,6 @@ importVehicles()
 
 console.log(`Imported ${records.length} vehicles from CSV.`)
 
-
-
 db.exec(`
   CREATE TABLE IF NOT EXISTS emission_factors (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -209,7 +204,6 @@ db.exec(`
     source TEXT
   )
 `)
-
 
 const existingPetrolFactor = db.prepare(`
   SELECT id
@@ -262,7 +256,6 @@ db.exec(`
   )
 `)
 
-
 // Users table for registration and login
 db.exec(`
   CREATE TABLE IF NOT EXISTS users (
@@ -273,6 +266,29 @@ db.exec(`
     createdAt TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
   )
 `)
+
+// Budget and alert settings on the users table
+const userColumnNames = db
+  .prepare('PRAGMA table_info(users)')
+  .all()
+  .map((column) => column.name)
+
+if (!userColumnNames.includes('carbonBudget')) {
+  db.exec('ALTER TABLE users ADD COLUMN carbonBudget REAL NOT NULL DEFAULT 500')
+}
+
+if (!userColumnNames.includes('alertEmail')) {
+  db.exec('ALTER TABLE users ADD COLUMN alertEmail TEXT')
+}
+
+if (!userColumnNames.includes('alertsEnabled')) {
+  db.exec('ALTER TABLE users ADD COLUMN alertsEnabled INTEGER NOT NULL DEFAULT 0')
+}
+
+// 0 = no alert sent, otherwise the last level emailed: 80, 90 or 100
+if (!userColumnNames.includes('lastAlertLevel')) {
+  db.exec('ALTER TABLE users ADD COLUMN lastAlertLevel INTEGER NOT NULL DEFAULT 0')
+}
 
 // Add userId to history so calculations can belong to users
 const historyColumns = db.prepare(
@@ -285,11 +301,9 @@ if (!historyColumnNames.includes('userId')) {
   db.exec('ALTER TABLE calculation_history ADD COLUMN userId INTEGER')
 }
 
-
 const app = express()
 app.use(cors())
 app.use(express.json())
-
 
 // Require a JWT secret in the backend .env file
 if (!process.env.JWT_SECRET) {
@@ -337,6 +351,144 @@ function requireAuth(req, res, next) {
   }
 }
 
+// ---------------------------------------------------------------
+// Email alerts (Gmail SMTP through Nodemailer)
+// Needs GMAIL_USER and GMAIL_APP_PASSWORD in the backend .env file.
+// ---------------------------------------------------------------
+
+const EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/
+
+const mailer =
+  process.env.GMAIL_USER && process.env.GMAIL_APP_PASSWORD
+    ? nodemailer.createTransport({
+        service: 'gmail',
+        auth: {
+          user: process.env.GMAIL_USER,
+          pass: process.env.GMAIL_APP_PASSWORD
+        }
+      })
+    : null
+
+if (!mailer) {
+  console.log(
+    'Email alerts are off: set GMAIL_USER and GMAIL_APP_PASSWORD in .env to turn them on.'
+  )
+}
+
+function levelFor(percent) {
+  if (percent >= 100) return 100
+  if (percent >= 90) return 90
+  if (percent >= 80) return 80
+  return 0
+}
+
+function getBudgetStatus(userId) {
+  const user = db.prepare(`
+    SELECT name, carbonBudget, alertEmail, alertsEnabled, lastAlertLevel
+    FROM users
+    WHERE id = ?
+  `).get(userId)
+
+  if (!user) return null
+
+  const totals = db.prepare(`
+    SELECT COALESCE(SUM(co2Kg), 0) AS totalCO2
+    FROM calculation_history
+    WHERE userId = ?
+  `).get(userId)
+
+  const budget = Number(user.carbonBudget) > 0 ? Number(user.carbonBudget) : 500
+  const totalCO2 = Number(totals.totalCO2)
+  const percent = (totalCO2 / budget) * 100
+
+  return { user, budget, totalCO2, percent, level: levelFor(percent) }
+}
+
+async function sendBudgetAlertEmail({ to, name, level, percent, totalCO2, budget }) {
+  if (!mailer) {
+    console.log('Alert skipped: email is not configured.')
+    return false
+  }
+
+  const heading =
+    level >= 100
+      ? 'You have used your whole carbon budget'
+      : `You have used ${level}% of your carbon budget`
+
+  // Plain text only, so nothing a user typed can be turned into markup.
+  const text = [
+    `Hi ${name || 'there'},`,
+    '',
+    heading + '.',
+    '',
+    `Total CO2 so far: ${totalCO2.toFixed(2)} kg`,
+    `Your budget: ${budget} kg`,
+    `Used: ${Math.round(percent)}%`,
+    '',
+    'You can change your budget or turn these emails off from the Dashboard.',
+    '',
+    'Carbon Footprint'
+  ].join('\n')
+
+  await mailer.sendMail({
+    from: `"Carbon Footprint" <${process.env.GMAIL_USER}>`,
+    to,
+    subject: `Carbon Footprint: ${heading.toLowerCase()}`,
+    text
+  })
+
+  return true
+}
+
+// Sends one email each time a user crosses 80%, 90% or 100% of their budget.
+async function checkBudgetAlert(userId) {
+  const status = getBudgetStatus(userId)
+
+  if (!status) return null
+
+  const { user, budget, totalCO2, percent, level } = status
+  const result = {
+    percent: Math.round(percent),
+    level,
+    budget,
+    totalCO2,
+    emailSent: false
+  }
+
+  // Budget went up or history changed: allow future alerts again.
+  if (level < user.lastAlertLevel) {
+    db.prepare('UPDATE users SET lastAlertLevel = ? WHERE id = ?').run(level, userId)
+    return result
+  }
+
+  if (level > user.lastAlertLevel) {
+    if (user.alertsEnabled && user.alertEmail) {
+      try {
+        const sent = await sendBudgetAlertEmail({
+          to: user.alertEmail,
+          name: user.name,
+          level,
+          percent,
+          totalCO2,
+          budget
+        })
+
+        if (sent) {
+          db.prepare('UPDATE users SET lastAlertLevel = ? WHERE id = ?').run(
+            level,
+            userId
+          )
+          result.emailSent = true
+        }
+      } catch (error) {
+        console.error('Could not send alert email:', String(error.message || error))
+      }
+    }
+  }
+
+  return result
+}
+
 // REGISTER
 app.post('/api/auth/register', async (req, res) => {
   const { name, email, password } = req.body
@@ -356,10 +508,7 @@ app.post('/api/auth/register', async (req, res) => {
     })
   }
 
-  if (
-    cleanedEmail.length > 254 ||
-    !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(cleanedEmail)
-  ) {
+  if (cleanedEmail.length > 254 || !EMAIL_PATTERN.test(cleanedEmail)) {
     return res.status(400).json({
       error: 'Please enter a valid email address.'
     })
@@ -481,25 +630,197 @@ app.get('/api/auth/me', requireAuth, (req, res) => {
 })
 
 app.get('/', (req, res) => {
-  res.send('Eco Track+ Backend is running!')
+  res.send('Carbon Footprint backend is running!')
 })
-
 
 app.get('/api/vehicles', (req, res) => {
-   const vehicles = db.prepare('SELECT * FROM vehicles').all()
+  const vehicles = db.prepare('SELECT * FROM vehicles').all()
   res.json(vehicles)
 })
-
 
 app.get('/api/emission-factors', (req, res) => {
   const factors = db.prepare('SELECT * FROM emission_factors').all()
   res.json(factors)
 })
 
+// ---------------------------------------------------------------
+// Budget and alert settings
+// ---------------------------------------------------------------
 
+app.get('/api/settings', requireAuth, (req, res) => {
+  const user = db.prepare(`
+    SELECT carbonBudget, alertEmail, alertsEnabled
+    FROM users
+    WHERE id = ?
+  `).get(req.user.id)
 
+  if (!user) {
+    return res.status(404).json({ error: 'User account not found.' })
+  }
 
-app.post('/api/history', requireAuth, (req, res) => {
+  res.json({
+    carbonBudget: Number(user.carbonBudget),
+    alertEmail: user.alertEmail || '',
+    alertsEnabled: Boolean(user.alertsEnabled),
+    emailConfigured: Boolean(mailer)
+  })
+})
+
+app.put('/api/settings', requireAuth, (req, res) => {
+  const budget = Number(req.body.carbonBudget)
+  const alertsEnabled = Boolean(req.body.alertsEnabled)
+  const alertEmail = String(req.body.alertEmail || '').trim().toLowerCase()
+
+  if (!Number.isFinite(budget) || budget <= 0 || budget > 10000000) {
+    return res.status(400).json({
+      error: 'Budget must be a number greater than 0.'
+    })
+  }
+
+  if (alertEmail && (alertEmail.length > 254 || !EMAIL_PATTERN.test(alertEmail))) {
+    return res.status(400).json({
+      error: 'Please enter a valid alert email address.'
+    })
+  }
+
+  if (alertsEnabled && !alertEmail) {
+    return res.status(400).json({
+      error: 'Add an email address to turn alerts on.'
+    })
+  }
+
+  try {
+    db.prepare(`
+      UPDATE users
+      SET carbonBudget = ?, alertEmail = ?, alertsEnabled = ?
+      WHERE id = ?
+    `).run(budget, alertEmail || null, alertsEnabled ? 1 : 0, req.user.id)
+
+    // Start from the current level, so saving settings never sends an old alert.
+    const status = getBudgetStatus(req.user.id)
+
+    db.prepare('UPDATE users SET lastAlertLevel = ? WHERE id = ?').run(
+      status ? status.level : 0,
+      req.user.id
+    )
+
+    res.json({
+      message: 'Settings saved.',
+      carbonBudget: budget,
+      alertEmail,
+      alertsEnabled,
+      emailConfigured: Boolean(mailer)
+    })
+  } catch (error) {
+    console.error('Error saving settings:', error)
+    res.status(500).json({ error: 'Could not save settings.' })
+  }
+})
+
+// Sends a test email so a user can confirm alerts reach them.
+app.post('/api/settings/test-email', requireAuth, async (req, res) => {
+  if (!mailer) {
+    return res.status(503).json({
+      error: 'Email is not configured on the server.'
+    })
+  }
+
+  const user = db.prepare(`
+    SELECT name, alertEmail
+    FROM users
+    WHERE id = ?
+  `).get(req.user.id)
+
+  if (!user || !user.alertEmail) {
+    return res.status(400).json({
+      error: 'Save an alert email first.'
+    })
+  }
+
+  try {
+    await mailer.sendMail({
+      from: `"Carbon Footprint" <${process.env.GMAIL_USER}>`,
+      to: user.alertEmail,
+      subject: 'Carbon Footprint: test alert',
+      text: `Hi ${user.name || 'there'},\n\nThis is a test. Your budget alerts will arrive at this address.\n\nCarbon Footprint`
+    })
+
+    res.json({ message: `Test email sent to ${user.alertEmail}.` })
+  } catch (error) {
+    console.error('Test email error:', String(error.message || error))
+    res.status(502).json({
+      error: 'Could not send the test email. Check the Gmail settings in .env.'
+    })
+  }
+})
+
+// Emails the user's current total emissions on demand.
+const lastSummaryAt = new Map()
+
+app.post('/api/settings/send-summary', requireAuth, async (req, res) => {
+  if (!mailer) {
+    return res.status(503).json({
+      error: 'Email is not configured on the server.'
+    })
+  }
+
+  // One summary per minute per user, so the button cannot be used to spam.
+  const now = Date.now()
+  const last = lastSummaryAt.get(req.user.id) || 0
+
+  if (now - last < 60 * 1000) {
+    return res.status(429).json({
+      error: 'Please wait a minute before sending another summary.'
+    })
+  }
+
+  const status = getBudgetStatus(req.user.id)
+
+  if (!status || !status.user.alertEmail) {
+    return res.status(400).json({
+      error: 'Save an alert email first.'
+    })
+  }
+
+  const { user, budget, totalCO2, percent } = status
+
+  const count = db.prepare(`
+    SELECT COUNT(*) AS total
+    FROM calculation_history
+    WHERE userId = ?
+  `).get(req.user.id).total
+
+  try {
+    await mailer.sendMail({
+      from: `"Carbon Footprint" <${process.env.GMAIL_USER}>`,
+      to: user.alertEmail,
+      subject: 'Carbon Footprint: your current total emissions',
+      text: [
+        `Hi ${user.name || 'there'},`,
+        '',
+        'Here is your current total.',
+        '',
+        `Total CO2 so far: ${totalCO2.toFixed(2)} kg`,
+        `Saved calculations: ${count}`,
+        `Your budget: ${budget} kg`,
+        `Used: ${Math.round(percent)}%`,
+        '',
+        'Carbon Footprint'
+      ].join('\n')
+    })
+
+    lastSummaryAt.set(req.user.id, now)
+
+    res.json({ message: `Summary sent to ${user.alertEmail}.` })
+  } catch (error) {
+    console.error('Summary email error:', String(error.message || error))
+    res.status(502).json({
+      error: 'Could not send the summary. Check the Gmail settings in .env.'
+    })
+  }
+})
+
+app.post('/api/history', requireAuth, async (req, res) => {
   const {
     vehicleMake,
     vehicleModel,
@@ -532,33 +853,43 @@ app.post('/api/history', requireAuth, (req, res) => {
 
   try {
     const result = db.prepare(`
-  INSERT INTO calculation_history (
-    userId,
-    vehicleMake,
-    vehicleModel,
-    modelYear,
-    distanceKm,
-    mileageKmPerLitre,
-    fuelConsumedLitres,
-    emissionFactor,
-    co2Kg
-  )
-  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-`).run(
-  req.user.id,
-  vehicleMake,
-  vehicleModel,
-  Number(modelYear),
-  Number(distanceKm),
-  Number(mileageKmPerLitre),
-  Number(fuelConsumedLitres),
-  Number(emissionFactor),
-  Number(co2Kg)
-)
+      INSERT INTO calculation_history (
+        userId,
+        vehicleMake,
+        vehicleModel,
+        modelYear,
+        distanceKm,
+        mileageKmPerLitre,
+        fuelConsumedLitres,
+        emissionFactor,
+        co2Kg
+      )
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      req.user.id,
+      vehicleMake,
+      vehicleModel,
+      Number(modelYear),
+      Number(distanceKm),
+      Number(mileageKmPerLitre),
+      Number(fuelConsumedLitres),
+      Number(emissionFactor),
+      Number(co2Kg)
+    )
+
+    // The calculation is saved, so a failed alert must never fail the request.
+    let alert = null
+
+    try {
+      alert = await checkBudgetAlert(req.user.id)
+    } catch (alertError) {
+      console.error('Budget alert check failed:', alertError)
+    }
 
     res.status(201).json({
       message: 'Calculation saved successfully.',
-      id: result.lastInsertRowid
+      id: result.lastInsertRowid,
+      alert
     })
   } catch (error) {
     console.error('Error saving calculation:', error)
@@ -586,7 +917,28 @@ app.get('/api/history', requireAuth, (req, res) => {
   }
 })
 
+// Deletes all of the logged-in user's saved calculations.
+app.delete('/api/history', requireAuth, (req, res) => {
+  try {
+    const result = db.prepare(`
+      DELETE FROM calculation_history
+      WHERE userId = ?
+    `).run(req.user.id)
 
+    // Totals are back to zero, so budget alerts can fire again.
+    db.prepare('UPDATE users SET lastAlertLevel = 0 WHERE id = ?').run(req.user.id)
+
+    res.json({
+      message: 'All calculations cleared.',
+      deleted: result.changes
+    })
+  } catch (error) {
+    console.error('Error clearing history:', error)
+    res.status(500).json({
+      error: 'Failed to clear calculation history.'
+    })
+  }
+})
 
 app.post('/api/auth/forgot-password', (req, res) => {
   const email = String(req.body.email || '').trim().toLowerCase()
@@ -697,10 +1049,7 @@ app.post('/api/auth/reset-password', async (req, res) => {
   }
 })
 
-
-
 // Function to check if a message is related to the emission dashboard
-
 
 function isEmissionDashboardQuestion(message) {
   const text = message.toLowerCase()
@@ -708,10 +1057,6 @@ function isEmissionDashboardQuestion(message) {
   return /\b(emission|emissions|co2|carbon|history|historical|calculation|calculations|dashboard)\b/i.test(text)
     && /\b(my|mine|all|total|overall|history|historical|previous|last|latest|saved|recorded|calculate|show|what|how)\b/i.test(text)
 }
-
-
-
-
 
 // Gemini AI Assistant endpoint
 
@@ -740,33 +1085,30 @@ app.post('/api/assistant', requireAuth, async (req, res) => {
         error: 'Gemini is not configured. Check your backend .env file.'
       })
     }
-    
 
+    let dashboardContext = ''
 
+    if (isEmissionDashboardQuestion(message)) {
+      const summary = db.prepare(`
+        SELECT
+          COUNT(*) AS totalCalculations,
+          COALESCE(SUM(co2Kg), 0) AS totalCO2,
+          COALESCE(SUM(distanceKm), 0) AS totalDistance
+        FROM calculation_history
+        WHERE userId = ?
+      `).get(req.user.id)
 
-let dashboardContext = ''
+      const history = db.prepare(`
+        SELECT vehicleMake, vehicleModel, modelYear,
+               distanceKm, co2Kg, calculatedAt
+        FROM calculation_history
+        WHERE userId = ?
+        ORDER BY calculatedAt DESC, id DESC
+        LIMIT 5
+      `).all(req.user.id)
 
-if (isEmissionDashboardQuestion(message)) {
-  const summary = db.prepare(`
-    SELECT
-      COUNT(*) AS totalCalculations,
-      COALESCE(SUM(co2Kg), 0) AS totalCO2,
-      COALESCE(SUM(distanceKm), 0) AS totalDistance
-    FROM calculation_history
-    WHERE userId = ?
-  `).get(req.user.id)
-
-  const history = db.prepare(`
-    SELECT vehicleMake, vehicleModel, modelYear,
-           distanceKm, co2Kg, calculatedAt
-    FROM calculation_history
-    WHERE userId = ?
-    ORDER BY calculatedAt DESC, id DESC
-    LIMIT 5
-  `).all(req.user.id)
-
-  if (summary.totalCalculations > 0) {
-    dashboardContext = `
+      if (summary.totalCalculations > 0) {
+        dashboardContext = `
 Total saved calculations: ${summary.totalCalculations}
 Total CO2 emissions: ${Number(summary.totalCO2).toFixed(2)} kg
 Total distance travelled: ${Number(summary.totalDistance).toFixed(2)} km
@@ -779,16 +1121,13 @@ CO2: ${Number(item.co2Kg).toFixed(2)} kg
 Date: ${item.calculatedAt}
 `).join('\n')}
 `
-  } else {
-    dashboardContext = 'No saved emission calculations were found for this user.'
-  }
-}
+      } else {
+        dashboardContext = 'No saved emission calculations were found for this user.'
+      }
+    }
 
-
-
-    
-const prompt = `
-You are EcoTrackPlus Assistant, a helpful environmental
+    const prompt = `
+You are Carbon Footprint Assistant, a helpful environmental
 and vehicle-emissions assistant.
 
 Answer clearly and accurately.
@@ -808,19 +1147,18 @@ User question:
 ${message}
 `
 
-
     let reply
 
     for (let attempt = 1; attempt <= 3; attempt++) {
       try {
         console.log('Sending request to Gemini...')
 
-const result = await genAI.models.generateContent({
-  model: process.env.GEMINI_MODEL || 'gemini-3.8-flash',
-  contents: prompt
-})
+        const result = await genAI.models.generateContent({
+          model: process.env.GEMINI_MODEL || 'gemini-3.8-flash',
+          contents: prompt
+        })
 
-console.log('Gemini response received')
+        console.log('Gemini response received')
 
         reply = result.text?.trim()
 
@@ -869,8 +1207,6 @@ console.log('Gemini response received')
     })
   }
 })
-
-
 
 app.listen(5000, () => {
   console.log('Server running on port 5000')
