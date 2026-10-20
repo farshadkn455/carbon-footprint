@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
 import './App.css'
 
-const API_URL = 'http://localhost:5000'
+const API_URL = import.meta.env.VITE_API_URL || ''
 const APP_NAME = 'Carbon Footprint'
 
 // Fill these in with your real data sources.
@@ -55,6 +55,177 @@ function BudgetBanner({ percent, budget, total, emailNotice }) {
     </div>
   )
 }
+
+const PERIODS = [
+  ['day', 'Day'],
+  ['week', 'Week'],
+  ['month', 'Month'],
+  ['year', 'Year']
+]
+
+const THIS_PERIOD = {
+  day: 'today',
+  week: 'this week',
+  month: 'this month',
+  year: 'this year'
+}
+
+const LAST_PERIOD = {
+  day: 'Yesterday',
+  week: 'Last week',
+  month: 'Last month',
+  year: 'Last year'
+}
+
+function kg(value) {
+  return Number(value || 0).toFixed(2)
+}
+
+function TrackingPanel({ period, onPeriodChange, summary, loading, error }) {
+  const shown = summary?.period || period
+  const trend = summary?.trend || []
+  const maxValue = Math.max(...trend.map((bucket) => bucket.co2Kg), 0)
+  const totals = summary?.totals
+
+  return (
+    <section
+      className={loading && summary ? 'panel track is-loading' : 'panel track'}
+      aria-labelledby="track-title"
+    >
+      <div className="track-head">
+        <div>
+          <h3 id="track-title">Emission tracking</h3>
+          {summary && (
+            <p className="muted">
+              {summary.periodTitle}: {summary.rangeText}
+            </p>
+          )}
+        </div>
+
+        <div className="seg" role="group" aria-label="Tracking period">
+          {PERIODS.map(([value, label]) => (
+            <button
+              key={value}
+              type="button"
+              className={period === value ? 'seg-btn active' : 'seg-btn'}
+              aria-pressed={period === value}
+              onClick={() => onPeriodChange(value)}
+            >
+              {label}
+            </button>
+          ))}
+        </div>
+      </div>
+
+      {error && <p className="history-error">{error}</p>}
+      {!summary && loading && <p className="muted">Loading tracking data...</p>}
+
+      {summary && totals && (
+        <>
+          <div className="track-body">
+            <div className="track-total">
+              <span className="track-total-label">
+                Estimated CO₂ {THIS_PERIOD[shown]}
+              </span>
+
+              <div className="track-total-num">
+                {kg(totals.co2Kg)} <small>kg</small>
+              </div>
+
+              <p className="track-prev">
+                {LAST_PERIOD[shown]}: {kg(summary.previousCo2Kg)} kg
+              </p>
+
+              <div className="track-stats">
+                <div>
+                  <span className="track-stat-value">{totals.distanceKm.toFixed(1)}</span>
+                  <span className="track-stat-label">km travelled</span>
+                </div>
+                <div>
+                  <span className="track-stat-value">{totals.fuelLitres.toFixed(1)}</span>
+                  <span className="track-stat-label">litres of fuel</span>
+                </div>
+                <div>
+                  <span className="track-stat-value">{totals.calculations}</span>
+                  <span className="track-stat-label">calculations</span>
+                </div>
+              </div>
+            </div>
+
+            <div className="track-chart">
+              <div
+                className="track-bars"
+                role="img"
+                aria-label={`Estimated CO2 for each of the last ${trend.length} ${shown}s`}
+              >
+                {trend.map((bucket) => {
+                  const ratio = maxValue > 0 ? bucket.co2Kg / maxValue : 0
+
+                  return (
+                    <div
+                      key={bucket.key}
+                      className={bucket.isCurrent ? 'track-col current' : 'track-col'}
+                      title={`${bucket.label}: ${kg(bucket.co2Kg)} kg from ${bucket.calculations} calculation${bucket.calculations === 1 ? '' : 's'}`}
+                    >
+                      <span className="track-val">
+                        {bucket.co2Kg > 0 ? bucket.co2Kg.toFixed(1) : ''}
+                      </span>
+                      <div
+                        className={bucket.co2Kg > 0 ? 'track-bar' : 'track-bar zero'}
+                        style={{ '--bar': ratio }}
+                      />
+                      <span className="track-lab">{bucket.label}</span>
+                    </div>
+                  )
+                })}
+              </div>
+
+              {totals.calculations === 0 && (
+                <p className="muted track-empty">
+                  Nothing calculated {THIS_PERIOD[shown]} yet. Use the calculator to add a trip.
+                </p>
+              )}
+            </div>
+          </div>
+
+          <div className="track-vehicles">
+            <h4>Emissions by vehicle, {THIS_PERIOD[shown]}</h4>
+
+            {summary.vehicles.length === 0 ? (
+              <p className="muted">No vehicles used {THIS_PERIOD[shown]}.</p>
+            ) : (
+              <ol className="rank">
+                {summary.vehicles.map((vehicle) => (
+                  <li key={vehicle.name}>
+                    <div className="rank-top">
+                      <span className="rank-name">
+                        {vehicle.name}
+                        <small>
+                          {vehicle.distanceKm.toFixed(1)} km, {vehicle.calculations}{' '}
+                          {vehicle.calculations === 1 ? 'calculation' : 'calculations'}
+                        </small>
+                      </span>
+                      <strong>{kg(vehicle.co2Kg)} kg</strong>
+                    </div>
+                    <div className="rank-track">
+                      <div
+                        className="rank-fill"
+                        style={{
+                          width: `${totals.co2Kg > 0 ? (vehicle.co2Kg / totals.co2Kg) * 100 : 0}%`
+                        }}
+                      />
+                    </div>
+                  </li>
+                ))}
+              </ol>
+            )}
+          </div>
+        </>
+      )}
+    </section>
+  )
+}
+
 
 function App() {
   const [vehicleMake, setVehicleMake] = useState('')
@@ -124,6 +295,42 @@ function App() {
   const [settingsError, setSettingsError] = useState('')
   const [settingsSaving, setSettingsSaving] = useState(false)
   const [alertNotice, setAlertNotice] = useState('')
+
+  // Emission tracking by day, week, month and year.
+  const [trackPeriod, setTrackPeriod] = useState('week')
+  const [trackSummary, setTrackSummary] = useState(null)
+  const [trackLoading, setTrackLoading] = useState(false)
+  const [trackError, setTrackError] = useState('')
+  const trackRequestId = useRef(0)
+
+  async function loadTracking(period) {
+    const requestId = ++trackRequestId.current
+    setTrackLoading(true)
+    setTrackError('')
+
+    try {
+      // Send the browser's UTC offset so "today" matches the user's own calendar day.
+      const tzMinutes = -new Date().getTimezoneOffset()
+      const response = await fetch(
+        `${API_URL}/api/history/summary?period=${period}&tz=${tzMinutes}`,
+        { headers: { Authorization: `Bearer ${authToken}` } }
+      )
+      const data = await response.json()
+
+      if (!response.ok) {
+        throw new Error(data.error || 'Could not load emission tracking.')
+      }
+
+      // Ignore answers that arrive after the user has already switched tabs.
+      if (requestId === trackRequestId.current) setTrackSummary(data)
+    } catch (error) {
+      if (requestId === trackRequestId.current) {
+        setTrackError(error.message || 'Could not connect to the backend.')
+      }
+    } finally {
+      if (requestId === trackRequestId.current) setTrackLoading(false)
+    }
+  }
 
   async function loadSettings(token) {
     try {
@@ -256,6 +463,12 @@ function App() {
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [authToken])
+
+  // Load the tracking totals whenever the Dashboard opens or the period changes.
+  useEffect(() => {
+    if (authToken && showDashboard) loadTracking(trackPeriod)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [authToken, showDashboard, trackPeriod])
 
   // Keep the newest assistant message in view.
   useEffect(() => {
@@ -401,6 +614,8 @@ function App() {
     setAuthToken('')
     setAuthUser(null)
     setHistoryRecords([])
+    setTrackSummary(null)
+    setTrackError('')
     setEmissionResult(null)
     setAuthEmail('')
     setAuthPassword('')
@@ -1213,6 +1428,14 @@ function App() {
                 </div>
               </div>
             </div>
+
+            <TrackingPanel
+              period={trackPeriod}
+              onPeriodChange={setTrackPeriod}
+              summary={trackSummary}
+              loading={trackLoading}
+              error={trackError}
+            />
 
             <form className="panel settings" onSubmit={saveSettings}>
               <h3>Budget and email alerts</h3>

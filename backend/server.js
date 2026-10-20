@@ -917,6 +917,237 @@ app.get('/api/history', requireAuth, (req, res) => {
   }
 })
 
+// ---------------------------------------------------------------
+// Emission tracking by day, week, month and year
+//
+// Reads the calculatedAt column that calculation_history already has.
+// ---------------------------------------------------------------
+
+const TRACK_PERIODS = {
+  day: { buckets: 7, title: 'Today' }, // trend: last 7 days
+  week: { buckets: 8, title: 'This week' }, // trend: last 8 weeks (Monday to Sunday)
+  month: { buckets: 12, title: 'This month' }, // trend: last 12 months
+  year: { buckets: 5, title: 'This year' } // trend: last 5 years
+}
+
+const SHORT_MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
+const LONG_MONTHS = [
+  'January', 'February', 'March', 'April', 'May', 'June',
+  'July', 'August', 'September', 'October', 'November', 'December'
+]
+const SHORT_DAYS = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat']
+
+// SQLite's CURRENT_TIMESTAMP is stored in UTC ("2026-10-20 14:05:00").
+// Dates are shifted by the browser's UTC offset first, then read with the
+// getUTC* methods, so a trip taken at 1 a.m. in India counts as that day
+// in India and not as the previous day in UTC.
+function parseSavedTime(value) {
+  const text = String(value || '').trim()
+  if (!text) return null
+
+  const iso = text.includes('T') ? text : text.replace(' ', 'T')
+  const hasZone = /(Z|[+-]\d{2}:\d{2})$/i.test(iso)
+  const date = new Date(hasZone ? iso : iso + 'Z')
+
+  return Number.isNaN(date.getTime()) ? null : date
+}
+
+function startOfPeriod(localDate, period) {
+  const y = localDate.getUTCFullYear()
+  const m = localDate.getUTCMonth()
+  const d = localDate.getUTCDate()
+
+  if (period === 'day') return new Date(Date.UTC(y, m, d))
+
+  if (period === 'week') {
+    const sinceMonday = (localDate.getUTCDay() + 6) % 7
+    return new Date(Date.UTC(y, m, d - sinceMonday))
+  }
+
+  if (period === 'month') return new Date(Date.UTC(y, m, 1))
+
+  return new Date(Date.UTC(y, 0, 1))
+}
+
+function shiftPeriod(start, period, count) {
+  const y = start.getUTCFullYear()
+  const m = start.getUTCMonth()
+  const d = start.getUTCDate()
+
+  if (period === 'day') return new Date(Date.UTC(y, m, d + count))
+  if (period === 'week') return new Date(Date.UTC(y, m, d + 7 * count))
+  if (period === 'month') return new Date(Date.UTC(y, m + count, 1))
+
+  return new Date(Date.UTC(y + count, 0, 1))
+}
+
+// The first day of a period, as YYYY-MM-DD, is a unique key for that period.
+function periodKey(start) {
+  return start.toISOString().slice(0, 10)
+}
+
+function periodLabel(start, period) {
+  const d = start.getUTCDate()
+  const month = SHORT_MONTHS[start.getUTCMonth()]
+  const year = start.getUTCFullYear()
+
+  if (period === 'day') return `${SHORT_DAYS[start.getUTCDay()]} ${d}`
+  if (period === 'week') return `${d} ${month}`
+  if (period === 'month') return `${month} '${String(year).slice(2)}`
+
+  return String(year)
+}
+
+function periodRangeText(start, period) {
+  const d = start.getUTCDate()
+  const m = start.getUTCMonth()
+  const y = start.getUTCFullYear()
+
+  if (period === 'day') return `${SHORT_DAYS[start.getUTCDay()]}, ${d} ${LONG_MONTHS[m]} ${y}`
+
+  if (period === 'week') {
+    const end = new Date(Date.UTC(y, m, d + 6))
+    return (
+      `${d} ${SHORT_MONTHS[m]} \u2013 ` +
+      `${end.getUTCDate()} ${SHORT_MONTHS[end.getUTCMonth()]} ${end.getUTCFullYear()}`
+    )
+  }
+
+  if (period === 'month') return `${LONG_MONTHS[m]} ${y}`
+
+  return String(y)
+}
+
+function roundTo(value, places = 3) {
+  const factor = 10 ** places
+  return Math.round((Number(value) || 0) * factor) / factor
+}
+
+// Pure function (no database access) so it is easy to test.
+function buildTrackingSummary(rows, period, tzMinutes, now = new Date()) {
+  const config = TRACK_PERIODS[period]
+  const currentStart = startOfPeriod(new Date(now.getTime() + tzMinutes * 60000), period)
+  const currentKey = periodKey(currentStart)
+
+  // One bar per period, oldest first, so empty periods still show as zero.
+  const trend = []
+
+  for (let back = config.buckets - 1; back >= 0; back--) {
+    const start = shiftPeriod(currentStart, period, -back)
+
+    trend.push({
+      key: periodKey(start),
+      label: periodLabel(start, period),
+      co2Kg: 0,
+      calculations: 0,
+      isCurrent: back === 0
+    })
+  }
+
+  const trendByKey = new Map(trend.map((bucket) => [bucket.key, bucket]))
+  const totals = { co2Kg: 0, distanceKm: 0, fuelLitres: 0, calculations: 0 }
+  const vehicleMap = new Map()
+
+  for (const row of rows) {
+    const savedAt = parseSavedTime(row.calculatedAt)
+    if (!savedAt) continue
+
+    const start = startOfPeriod(new Date(savedAt.getTime() + tzMinutes * 60000), period)
+    const key = periodKey(start)
+
+    const co2 = Number(row.co2Kg) || 0
+    const distance = Number(row.distanceKm) || 0
+    const fuel = Number(row.fuelConsumedLitres) || 0
+
+    const bucket = trendByKey.get(key)
+
+    if (bucket) {
+      bucket.co2Kg += co2
+      bucket.calculations += 1
+    }
+
+    // Totals and the vehicle breakdown cover the current period only.
+    if (key !== currentKey) continue
+
+    totals.co2Kg += co2
+    totals.distanceKm += distance
+    totals.fuelLitres += fuel
+    totals.calculations += 1
+
+    const name = `${row.vehicleMake} ${row.vehicleModel} (${row.modelYear})`
+    const entry = vehicleMap.get(name) || { name, co2Kg: 0, distanceKm: 0, calculations: 0 }
+
+    entry.co2Kg += co2
+    entry.distanceKm += distance
+    entry.calculations += 1
+    vehicleMap.set(name, entry)
+  }
+
+  const previousBucket = trend[trend.length - 2]
+
+  return {
+    period,
+    periodTitle: config.title,
+    rangeText: periodRangeText(currentStart, period),
+    totals: {
+      co2Kg: roundTo(totals.co2Kg),
+      distanceKm: roundTo(totals.distanceKm),
+      fuelLitres: roundTo(totals.fuelLitres),
+      calculations: totals.calculations
+    },
+    previousCo2Kg: roundTo(previousBucket ? previousBucket.co2Kg : 0),
+    trend: trend.map((bucket) => ({
+      key: bucket.key,
+      label: bucket.label,
+      co2Kg: roundTo(bucket.co2Kg),
+      calculations: bucket.calculations,
+      isCurrent: bucket.isCurrent
+    })),
+    vehicles: [...vehicleMap.values()]
+      .map((entry) => ({
+        name: entry.name,
+        co2Kg: roundTo(entry.co2Kg),
+        distanceKm: roundTo(entry.distanceKm),
+        calculations: entry.calculations
+      }))
+      .sort((a, b) => b.co2Kg - a.co2Kg)
+  }
+}
+
+// GET /api/history/summary?period=day|week|month|year&tz=330
+// tz is the browser's UTC offset in minutes (India is 330).
+app.get('/api/history/summary', requireAuth, (req, res) => {
+  const period = String(req.query.period || 'week')
+
+  if (!TRACK_PERIODS[period]) {
+    return res.status(400).json({
+      error: 'Period must be day, week, month or year.'
+    })
+  }
+
+  let tzMinutes = Number(req.query.tz ?? 0)
+
+  if (!Number.isInteger(tzMinutes) || Math.abs(tzMinutes) > 14 * 60) {
+    tzMinutes = 0
+  }
+
+  try {
+    const rows = db.prepare(`
+      SELECT vehicleMake, vehicleModel, modelYear,
+             distanceKm, fuelConsumedLitres, co2Kg, calculatedAt
+      FROM calculation_history
+      WHERE userId = ?
+    `).all(req.user.id)
+
+    res.json(buildTrackingSummary(rows, period, tzMinutes))
+  } catch (error) {
+    console.error('Error building tracking summary:', error)
+    res.status(500).json({
+      error: 'Failed to load emission tracking.'
+    })
+  }
+})
+
 // Deletes all of the logged-in user's saved calculations.
 app.delete('/api/history', requireAuth, (req, res) => {
   try {
@@ -1051,12 +1282,14 @@ app.post('/api/auth/reset-password', async (req, res) => {
 
 // Function to check if a message is related to the emission dashboard
 
+
+
 function isEmissionDashboardQuestion(message) {
   const text = message.toLowerCase()
 
-  return /\b(emission|emissions|co2|carbon|history|historical|calculation|calculations|dashboard)\b/i.test(text)
-    && /\b(my|mine|all|total|overall|history|historical|previous|last|latest|saved|recorded|calculate|show|what|how)\b/i.test(text)
+  return /\b(emission|emissions|co2|carbon|history|historical|calculation|calculations|dashboard|vehicle|vehicles|bike|bikes|motorcycle|motorcycles|petrol|fuel|travelled|traveled|distance|kilometres|kilometers|km|greener|alternative|eco|budget|footprint|most-used|most used|highest|lowest|reduce|saved|records)\b/i.test(text)
 }
+
 
 // Gemini AI Assistant endpoint
 
@@ -1107,11 +1340,40 @@ app.post('/api/assistant', requireAuth, async (req, res) => {
         LIMIT 5
       `).all(req.user.id)
 
+      
+      const vehicleEmissions = db.prepare(`
+        SELECT
+          vehicleMake,
+          vehicleModel,
+          modelYear,
+          COUNT(*) AS calculations,
+          SUM(distanceKm) AS totalDistanceKm,
+          SUM(fuelConsumedLitres) AS totalFuelLitres,
+          SUM(co2Kg) AS totalCO2Kg
+        FROM calculation_history
+        WHERE userId = ?
+        GROUP BY vehicleMake, vehicleModel, modelYear
+        ORDER BY totalCO2Kg DESC
+      `).all(req.user.id)
+
+
+
       if (summary.totalCalculations > 0) {
         dashboardContext = `
 Total saved calculations: ${summary.totalCalculations}
 Total CO2 emissions: ${Number(summary.totalCO2).toFixed(2)} kg
 Total distance travelled: ${Number(summary.totalDistance).toFixed(2)} km
+
+Emissions grouped by vehicle, highest first:
+${vehicleEmissions.map((vehicle, index) => `
+${index + 1}. ${vehicle.vehicleMake} ${vehicle.vehicleModel} (${vehicle.modelYear})
+Total CO2: ${Number(vehicle.totalCO2Kg).toFixed(2)} kg
+Distance: ${Number(vehicle.totalDistanceKm).toFixed(2)} km
+Fuel: ${Number(vehicle.totalFuelLitres).toFixed(2)} litres
+Calculations: ${vehicle.calculations}
+`).join('\n')}
+
+
 
 Latest five records:
 ${history.map((item, index) => `
@@ -1130,9 +1392,14 @@ Date: ${item.calculatedAt}
 You are Carbon Footprint Assistant, a helpful environmental
 and vehicle-emissions assistant.
 
+
 Answer clearly and accurately.
 Keep answers short and answer only what the user asks.
+Never claim that dashboard data is missing if it is present in the supplied context.
+For questions about which vehicle emits the most, use the emissions grouped by vehicle and identify the vehicle with the highest total CO2.
+For greener alternatives, use the saved vehicle model and fuel type when available. Clearly distinguish estimated suggestions from measured dashboard data.
 Do not invent user statistics.
+
 Use a dot (.) for bullet points only when a list is necessary.
 Never use asterisks (*) for formatting.
 Avoid unnecessary introductions and extra information.
